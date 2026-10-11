@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.system.Os;
 import android.util.Log;
@@ -39,6 +40,7 @@ public class MainActivity extends Activity {
   private static boolean nodeStarted = false;
 
   private WebView webView;
+  private PowerManager.WakeLock wakeLock;
 
   static {
     System.loadLibrary("node");
@@ -52,33 +54,27 @@ public class MainActivity extends Activity {
   protected void onCreate(Bundle state) {
     super.onCreate(state);
 
-    final File projectDir = new File(getFilesDir(), PROJECT_DIR);
-    try {
-      syncProjectAssets(projectDir);
-    } catch (IOException error) {
-      Log.e(TAG, "内置脚本解压失败", error);
-    }
-
-    File downloads = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
-    if (downloads == null) downloads = new File(getFilesDir(), "downloads");
-    setEnv("TMPDIR", getCacheDir().getAbsolutePath());
-    setEnv("HONGGUO_DATA_DIR", getFilesDir().getAbsolutePath());
-    setEnv("HONGGUO_DOWNLOADS", downloads.getAbsolutePath());
-    setEnv("HONGGUO_APP_VERSION", versionName());
-    setEnv("HONGGUO_PORT", String.valueOf(BRIDGE_PORT));
-
     if (!nodeStarted) {
       nodeStarted = true;
-      final String mainScript = new File(projectDir, "main.js").getAbsolutePath();
-      final String modulesPath = new File(projectDir, "node_modules").getAbsolutePath();
+      // 解压（首启 5MB）与环境变量都在后台线程做，别把冷启动卡在主线程上。
       new Thread(new Runnable() {
         @Override
         public void run() {
-          startNodeWithArguments(new String[]{"node", mainScript}, modulesPath, true);
+          File projectDir = new File(getFilesDir(), PROJECT_DIR);
+          try {
+            syncProjectAssets(projectDir);
+          } catch (IOException error) {
+            Log.e(TAG, "内置脚本解压失败", error);
+          }
+          prepareEnvironment();
+          startNodeWithArguments(
+              new String[]{"node", new File(projectDir, "main.js").getAbsolutePath()},
+              new File(projectDir, "node_modules").getAbsolutePath(), true);
         }
       }, "nodejs-mobile").start();
     }
 
+    // 下载跑在 Node 里，退到后台不能被 Doze 冻住 CPU（见 onStop）。
     webView = new WebView(this);
     WebSettings settings = webView.getSettings();
     settings.setJavaScriptEnabled(true);
@@ -122,13 +118,51 @@ public class MainActivity extends Activity {
   }
 
   @Override
+  protected void onStart() {
+    super.onStart();
+    // 可见时屏幕本来就亮着，不需要额外持锁；只在退到后台那段持有，省电。
+    releaseWakeLock();
+  }
+
+  @Override
+  protected void onStop() {
+    // 退到后台后 Doze 会冻结 CPU，Node 里的下载/转码就停在那儿了。
+    // ponytail: 只挡 CPU 休眠，挡不住低内存回收；真被杀进程了再上前台服务（要常驻通知 + POST_NOTIFICATIONS）。
+    acquireWakeLock();
+    super.onStop();
+  }
+
+  @Override
   protected void onDestroy() {
+    releaseWakeLock();
     if (webView != null) {
       webView.removeJavascriptInterface("AndroidBridge");
       webView.destroy();
       webView = null;
     }
     super.onDestroy();
+  }
+
+  private void acquireWakeLock() {
+    if (wakeLock != null) return;
+    try {
+      PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+      wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+      wakeLock.acquire();
+    } catch (Exception error) {
+      Log.w(TAG, "获取 WakeLock 失败: " + error.getMessage());
+      wakeLock = null;
+    }
+  }
+
+  private void releaseWakeLock() {
+    if (wakeLock == null) return;
+    try {
+      wakeLock.release();
+    } catch (Exception error) {
+      Log.w(TAG, "释放 WakeLock 失败: " + error.getMessage());
+    }
+    wakeLock = null;
   }
 
   /** 供 bridge.js 调用：打开外部链接（来源页面走系统浏览器）。 */
@@ -192,6 +226,9 @@ public class MainActivity extends Activity {
       } finally {
         in.close();
       }
+      // assets 里的文件解出来一律没有执行位，ffmpeg 这类要 execv 的二进制会 EACCES。
+      // 数据文件多了个 x 位无所谓，省掉一份「哪些要可执行」的清单。
+      if (!target.setExecutable(true, false)) Log.w(TAG, "设置执行位失败: " + target.getName());
       return;
     }
     target.mkdirs();
@@ -244,6 +281,17 @@ public class MainActivity extends Activity {
     } catch (Exception error) {
       return "0";
     }
+  }
+
+  /** 目录与环境变量：Node 起来之前设好，业务代码全程从 process.env 读。 */
+  private void prepareEnvironment() {
+    File downloads = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+    if (downloads == null) downloads = new File(getFilesDir(), "downloads");
+    setEnv("TMPDIR", getCacheDir().getAbsolutePath());
+    setEnv("HONGGUO_DATA_DIR", getFilesDir().getAbsolutePath());
+    setEnv("HONGGUO_DOWNLOADS", downloads.getAbsolutePath());
+    setEnv("HONGGUO_APP_VERSION", versionName());
+    setEnv("HONGGUO_PORT", String.valueOf(BRIDGE_PORT));
   }
 
   private static void setEnv(String name, String value) {

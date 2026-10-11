@@ -79,11 +79,17 @@
     }
   };
 
+  // preload.js 第一件事就是 require('electron')，之后只调一次 exposeInMainWorld 把 API 挂上去。
+  // 借此在 preload 用完的瞬间删掉 window.require：桌面端开了 contextIsolation，页面里根本没有
+  // require，这里保持同等暴露面，免得页面脚本能拿到任意 IPC channel。
   window.require = function (module) {
     if (module === 'electron') {
       return {
         contextBridge: {
-          exposeInMainWorld: function (name, api) { window[name] = api; }
+          exposeInMainWorld: function (name, api) {
+            window[name] = api;
+            try { delete window.require; } catch (error) { window.require = undefined; }
+          }
         },
         ipcRenderer: ipcRenderer
       };

@@ -8,6 +8,8 @@
  * hongguo-stream:// 与 hongguo-local:// 媒体地址改写成同源 http 地址后交给 protocol.handle 的原始处理函数。
  *
  * ponytail: 只支持单实例、单窗口；够用即可，多窗口需求出现再说。
+ * node:worker_threads（src/native/decrypt-worker.cjs，解密用）在 nodejs-mobile 上没在真机验证过；
+ * 真不支持时 new Worker 抛错 -> Promise reject -> 上层报错，不会静默走错分支。
  */
 const fs = require('fs');
 const http = require('http');
@@ -76,11 +78,11 @@ const protocolHandlers = new Map();
 const protocol = {
   registerSchemesAsPrivileged: () => {},
   handle: (scheme, handler) => { protocolHandlers.set(scheme, handler); },
-  replace: (scheme, handler) => { protocolHandlers.set(scheme, handler); },
 };
 
 // ===== 渲染层状态 =====
-const state = { staticRoot: null, indexFile: null, preloadPath: null };
+// 只服务一个窗口：谁调 loadFile，谁提供 dist-react 与 preload。
+const state = { staticRoot: null, indexFile: null, preloadPath: null, renderer: null };
 
 // ===== 主进程 -> 渲染层事件（SSE 广播）=====
 const sseClients = new Set();
@@ -97,17 +99,33 @@ class BrowserWindow {
     this.options = options;
     this._url = '';
     this._html = '';
-    const preload = options.webPreferences && options.webPreferences.preload;
-    if (preload) state.preloadPath = preload;
+    this._preloadPath = (options.webPreferences && options.webPreferences.preload) || null;
+    this._listeners = [];
     this.webContents = {
       send: (channel, payload) => publish(channel, payload),
       executeJavaScript: (code) => this.executeJavaScript(code),
       setWindowOpenHandler: (handler) => { this._windowOpenHandler = handler; },
-      on: () => this.webContents,
-      once: () => this.webContents,
+      on: (event, listener) => this.addListener(event, listener, false),
+      once: (event, listener) => this.addListener(event, listener, true),
       isDestroyed: () => false,
       getURL: () => this._url,
     };
+  }
+
+  addListener(event, listener, once) {
+    this._listeners.push({ event, listener, once });
+    return this.webContents;
+  }
+
+  /** main.js 只监听 did-finish-load（用来把 storage-error 补发给渲染层）。 */
+  emitContentEvent(event) {
+    const kept = [];
+    for (const entry of this._listeners) {
+      if (entry.event !== event) { kept.push(entry); continue; }
+      if (!entry.once) kept.push(entry);
+      try { entry.listener(); } catch (error) { console.error('[Bridge] 事件回调失败:', error.message); }
+    }
+    this._listeners = kept;
   }
 
   // 用 Node 侧抓取代替真实浏览器加载：搜索嗅探只需要页面 HTML。
@@ -128,10 +146,12 @@ class BrowserWindow {
     }
   }
 
-  // 主窗口：记下 dist-react 目录，桥接按此供给静态文件。
+  // 主窗口：记下 dist-react 目录，桥接按此供给静态文件。preload 跟着同一个窗口走。
   async loadFile(filePath) {
     state.indexFile = path.resolve(filePath);
     state.staticRoot = path.dirname(state.indexFile);
+    state.preloadPath = this._preloadPath;
+    state.renderer = this;
   }
 
   /**
@@ -265,11 +285,18 @@ function readBody(req, limit) {
   });
 }
 
+let rendererReady = false;
 function sseHandler(req, res) {
   res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
   res.write(': connected\n\n');
   sseClients.add(res);
   req.on('close', () => sseClients.delete(res));
+  // main.js 靠 did-finish-load 判断「现在能把 storage-error 发给渲染层了吗」。
+  // 本桥里渲染层订阅事件的时刻就是它连上 SSE 的时刻，比 index.html 返回更准（不会早于订阅）。
+  if (!rendererReady && state.renderer) {
+    rendererReady = true;
+    state.renderer.emitContentEvent('did-finish-load');
+  }
 }
 
 async function ipcRequest(req, res) {
