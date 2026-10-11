@@ -15,6 +15,9 @@ build/ffmpeg/*
 # 构建与打包输出
 release/
 out/
+android/build/
+# 签名密钥不入库：build-android.sh 缺省时用固定口令本地生成（debug key）
+android/keystore/
 .webpack/
 *.asar
 *.exe
