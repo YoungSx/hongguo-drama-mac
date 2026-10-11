@@ -60,8 +60,12 @@ if [ ! -f "$NODE_DIR/include/node/node.h" ] || [ ! -f "$NODE_DIR/bin/$ABI/libnod
   mkdir -p "$NODE_DIR"
   curl -fsSL -o "$CACHE/nodejs-mobile.tgz" \
     "https://registry.npmjs.org/nodejs-mobile-react-native/-/nodejs-mobile-react-native-${NODEJS_MOBILE_VERSION}.tgz"
-  tar -xzf "$CACHE/nodejs-mobile.tgz" -C "$NODE_DIR" --strip-components=1
+  # 只取 android 那份预编译 libnode。头文件和 bin/<abi>/libnode.so 都在 package/android/libnode 下，
+  # 剥掉这三层正好是 NODE_DIR 该有的布局（整包 100MB，iOS / React-Native 那部分用不上）。
+  tar -xzf "$CACHE/nodejs-mobile.tgz" -C "$NODE_DIR" --strip-components=3 package/android/libnode
 fi
+[ -f "$NODE_DIR/include/node/node.h" ] && [ -f "$NODE_DIR/bin/$ABI/libnode.so" ] \
+  || { echo "nodejs-mobile 不完整（缺 include/node 或 bin/$ABI/libnode.so）: $NODE_DIR" >&2; exit 1; }
 
 # ---- 渲染层 ----
 echo "[2/8] 构建渲染层"
@@ -77,6 +81,16 @@ node "$ROOT/android/scripts/collect-modules.js" "$ROOT" "$STAGE/node_modules" ax
 cp "$ROOT/android/shim/electron.js" "$STAGE/node_modules/electron/index.js"
 cp "$ROOT/android/shim/bridge.js" "$STAGE/node_modules/electron/bridge.js"
 printf '{"name":"electron","version":"0.0.0","main":"index.js"}\n' > "$STAGE/node_modules/electron/package.json"
+
+# 可选：放 build/ffmpeg/android-arm64/{ffmpeg,ffprobe}（aarch64-linux-android 静态构建）就一起打包，
+# main.js 的 resolveFfmpeg 正好找这个目录。没有就跳过：合并/转码会按既有逻辑返回
+# 「未找到完整 FFmpeg」，下载等其余功能不受影响。二进制不入库（见 .gitignore）。
+if [ -d "$ROOT/build/ffmpeg/android-arm64" ]; then
+  echo "  附带 ffmpeg: build/ffmpeg/android-arm64"
+  mkdir -p "$STAGE/build/ffmpeg"
+  cp -r "$ROOT/build/ffmpeg/android-arm64" "$STAGE/build/ffmpeg/"
+fi
+
 cp -r "$STAGE" "$ASSETS/nodejs-project"
 
 # ---- 资源（图标 + 清单用到的 values/xml）----
