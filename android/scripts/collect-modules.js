@@ -24,10 +24,14 @@ function walk(name) {
   if (seen.has(name)) return;
   seen.add(name);
   const dir = packageDir(name);
-  fs.cpSync(dir, path.join(out, name), {
+  const dest = path.join(out, name);
+  fs.cpSync(dir, dest, {
     recursive: true,
-    filter: (src) => !src.split(path.sep).includes('node_modules'),
+    // 只跳过包内的嵌套 node_modules。必须按相对包根的路径判断：
+    // 包根本身就位于项目的 node_modules/ 下，用整条绝对路径判断会把每个包都过滤掉。
+    filter: (src) => !path.relative(dir, src).split(path.sep).includes('node_modules'),
   });
+  if (!fs.existsSync(path.join(dest, 'package.json'))) throw new Error(`复制失败: ${name}`);
   const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
   for (const dep of Object.keys(pkg.dependencies || {})) walk(dep);
 }
